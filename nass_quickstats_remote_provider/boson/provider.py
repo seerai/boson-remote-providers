@@ -7,6 +7,7 @@ from datetime import datetime as _datetime
 import json
 import geopandas as gpd
 from cachetools import TTLCache, cached
+from shapely import geometry
 
 from boson.http import serve
 from boson.boson_core_pb2 import Property
@@ -31,6 +32,8 @@ class Boundaries:
         idx = self.df.intersects(geom)
         return self.df.copy().loc[idx]
 
+counties = Boundaries(COUNTIES_PATH)
+states = Boundaries(STATE_PATH)
 
 class APIWrapperRemoteProvider:
     def __init__(self) -> None:
@@ -41,23 +44,77 @@ class APIWrapperRemoteProvider:
             "key": "6F441079-980F-3F40-BE4B-F5F17B7ABED3",
         }
 
-    def parse_input_params(
+    
+    def get_counties_from_geometry(self, geom) -> gpd.GeoDataFrame:
+        '''
+        Given a geometry or bbox, return a geodataframe with 'county_name', 'state_name', 'geometry' (county geometry), sorted by 'COUNTYNS'
+        County_name and state_name are the index
+
+        input:
+        geom - shapely.geometry or bbox
+
+        output: 
+        counties_df - geopandas.GeoDataFrame
+        '''
+
+        if isinstance(geom, list) or isinstance(geom, tuple):
+            if len(geom) != 4:
+                raise ValueError("bbox must be a bounding box with 4 coordinates")
+            geom = geometry.box(*geom)
+
+        elif not isinstance(geom, geometry.base.BaseGeometry):
+            raise ValueError("geom must be a shapely geometry or a bbox")
+        
+        # get the counties that intersect with the geometry
+        counties_df = counties.intersects(geom)
+        if len(counties_df) == 0:
+            return gpd.GeoDataFrame(columns=["geometry", "id"])
+        
+        # get the states that intersect with the geometry, and drop all except the statefp and name
+        states_df = states.intersects(geom)
+        states_df = states_df[['STATEFP', 'NAME']]
+
+        # strip the whitespace from the statefp
+        counties_df['STATEFP'] = counties_df['STATEFP'].str.strip()
+        states_df['STATEFP'] = states_df['STATEFP'].str.strip()
+
+        # join the counties and states on the statefp
+        counties_df.set_index('STATEFP', inplace=True)
+        states_df.set_index('STATEFP', inplace=True)
+        counties_and_states = counties_df.join(states_df, rsuffix='_state')
+
+        counties_and_states.rename(columns={'NAME': 'county_name', 'NAME_state':'state_name'}, inplace=True)
+        counties_and_states = counties_and_states.sort_values(by=['COUNTYNS'])
+
+        counties_gdf = counties_and_states.set_index(['county_name', 'state_name'])
+        counties_gdf = counties_gdf[['geometry', 'COUNTYNS']]
+
+        return counties_gdf
+    
+    def get_states_from_geometry(self, geom) -> gpd.GeoDataFrame:
+        '''
+        do this later (for when we can only search by state)
+        '''
+        pass
+    
+
+    def create_query_list(
         self,
         bbox: List[float] = [],
         datetime: List[_datetime] = [],
         intersects: object = None,
-        collections: List[str] = [],
-        feature_ids: List[str] = [],
+        #collections: List[str] = [],
+        #feature_ids: List[str] = [],
         filter: Union[CQLFilter, dict] = None,
-        fields: Union[List[str], dict] = None,
-        sortby: dict = None,
+        #fields: Union[List[str], dict] = None,
+        #sortby: dict = None,
         method: str = "POST",
-        page: int = None,
-        page_size: int = None,
+        #page: int = None,
+        #page_size: int = None,
         **kwargs,
     ) -> List[dict]:
         """
-        This parses the geodesic search parameters and outputs a list of parameter dicts, one for each county and year
+        This parses the geodesic search parameters and outputs a list of parameter dicts, one for each state or county and year
         """
         api_params = {}
 
@@ -68,52 +125,39 @@ class APIWrapperRemoteProvider:
             api_params.update(self.api_default_params)
 
         """
-        BBOX
+        BBOX/INTERSECTS::
         bbox must be translated into a list of county names (or state names)
         """
         if bbox:
             logger.info(f"Input bbox: {bbox}")
+            geom = geometry.box(*bbox)
 
+        elif intersects:
+            logger.info(f"Input intersects: {intersects}")
+            geom = intersects
+
+        else:
+            logger.info("No bbox or intersects provided. Using US as default.")
+            geom = geometry.box(-179.9, 18.0, -66.9, 71.4)
+
+       counties_gdf = self.get_counties_from_geometry(geom) 
+
+        
         """
         DATETIME: Produce a list of years that intersect with the datetime range 
         """
         if datetime:
             logger.info(f"Received datetime: {datetime}")
 
-            # Example of how to handle datetime for an API that expect startdate and enddate in YYYY-MM-DD format
-            api_params["startdate"] = datetime[0].strftime("%Y-%m-%d")
-            api_params["enddate"] = datetime[1].strftime("%Y-%m-%d")
+            start_year = datetime[0].year
+            end_year = datetime[1].year
 
-        """
-        INTERSECTS: Handle provided geometry. Unless the API accepts a geometry, this will be difficult to implement.
-        In this example, we replace the bbox parameter with the bounding box of the geometry. This will provide
-        some preliminary filtering, and then the results could be further filtered to fit the geometry after the 
-        features are returned.
-        """
-        if intersects:
-            logger.info(f"Received geometry from intersects keyword with bounds: {intersects.bounds}")
-            # Example: take the bounds of the geometry and use as bbox
-            bbox = intersects.bounds
-            api_params["bbox"] = bbox
+            years_range = list(range(start_year, end_year + 1))
 
-        """ 
-        COLLECTIONS: Handle collections, if applicable. Not implemented in this example.
+        
         """
-        if collections:
-            logger.info(f"Received collections: {collections}")
-            logger.info("Collections are not implemented here")
-
-        """
-        IDS: Handle ids
-        """
-        if feature_ids:
-            logger.info(f"Received ids of length: {len(feature_ids)}")
-            api_params["ids"] = feature_ids  # TODO: Update the key to match the API
-
-        """
-        FILTER: Handle CQL2 filters. The cql2_to_query_params function will convert the CQL2 filter to a dictionary
-            for cql filters with the "logical_and" and "eq" operators. The CQL filters are the way to pass api parameters to the
-            search function.
+        FILTER:
+        convert cql filter to query parameters and update
         """
         if filter:
             logger.info(f"Received CQL filter")
