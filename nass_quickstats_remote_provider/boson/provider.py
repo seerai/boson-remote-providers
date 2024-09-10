@@ -6,6 +6,7 @@ from typing import List, Union
 from datetime import datetime as _datetime
 import json
 import geopandas as gpd
+from cachetools import TTLCache, cached
 
 from boson.http import serve
 from boson.boson_core_pb2 import Property
@@ -16,6 +17,10 @@ from google.protobuf.timestamp_pb2 import Timestamp
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.StreamHandler())
 logger.setLevel(logging.INFO)
+
+
+STATE_PATH = "app/states.geoparquet"
+COUNTIES_PATH = "app/counties.geoparquet"
 
 
 class Boundaries:
@@ -29,12 +34,11 @@ class Boundaries:
 
 class APIWrapperRemoteProvider:
     def __init__(self) -> None:
-        self.api_url = "api endpoint url goes here"
-        self.max_page_size = 200
+        self.api_url = "https://quickstats.nass.usda.gov/api/api_GET/"
+        self.max_page_size = 50000
+        # FIXME: take API key out of provider code
         self.api_default_params = {
-            # TODO: Add default parameters to the request
-            "api_key": "api key goes here",
-            "format": "json",
+            "key": "6F441079-980F-3F40-BE4B-F5F17B7ABED3",
         }
 
     def parse_input_params(
@@ -51,30 +55,27 @@ class APIWrapperRemoteProvider:
         page: int = None,
         page_size: int = None,
         **kwargs,
-    ) -> dict:
+    ) -> List[dict]:
         """
-        Translate geodesic input parameters to API parameters. This function accepts the boson search function
-        parameters and returns a dictionary (api_params) with the parameters to be used in the API request.
+        This parses the geodesic search parameters and outputs a list of parameter dicts, one for each county and year
         """
         api_params = {}
 
         """
-        DEFAULTS: Add default parameters to the request. TODO: Edit these in the __init__ method.
+        DEFAULTS
         """
         if self.api_default_params:
             api_params.update(self.api_default_params)
 
         """
-        BBOX: Add the bbox to the request, if it was provided
+        BBOX
+        bbox must be translated into a list of county names (or state names)
         """
         if bbox:
             logger.info(f"Input bbox: {bbox}")
-            api_params["bbox"] = bbox
-        else:
-            logger.info("No bbox provided")
 
         """
-        DATETIME: datetimes are provided as a list of two timestamps. TODO: Convert to whatever the API expects
+        DATETIME: Produce a list of years that intersect with the datetime range 
         """
         if datetime:
             logger.info(f"Received datetime: {datetime}")
@@ -256,12 +257,18 @@ class APIWrapperRemoteProvider:
             page_size = pagination.get("page_size", self.max_page_size)
 
         """
-        PROVIDER_PROPERTIES: These are the properties set in the boson_config.properties. These are an
-        advanced feature and may not be needed for most providers. 
+        PROVIDER_PROPERTIES: 
         """
         if provider_properties:
             logger.info(f"Received provider_properties from boson_config.properties: {provider_properties}")
             # Check for source_desc (Program)
+            source_desc = provider_properties.get("source_desc", "SURVEY")
+            kwargs["source_desc"] = source_desc
+
+            # Check for statisticcat_desc (Statistic Category)
+            statisticcat_desc = provider_properties.get("statisticcat_desc", None)
+            if statisticcat_desc:
+                kwargs["statisticcat_desc"] = statisticcat_desc
 
         gdf = self.request_features(page=page, page_size=page_size, **kwargs)
 
