@@ -1,0 +1,4 @@
+geodesic-api[geopandas]
+geodesic-api[jupyter]
+boson-sdk[all]
+pyarrow
