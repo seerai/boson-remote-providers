@@ -32,8 +32,10 @@ class Boundaries:
         idx = self.df.intersects(geom)
         return self.df.copy().loc[idx]
 
+
 counties = Boundaries(COUNTIES_PATH)
 states = Boundaries(STATE_PATH)
+
 
 class APIWrapperRemoteProvider:
     def __init__(self) -> None:
@@ -44,18 +46,17 @@ class APIWrapperRemoteProvider:
             "key": "6F441079-980F-3F40-BE4B-F5F17B7ABED3",
         }
 
-    
     def get_counties_from_geometry(self, geom) -> gpd.GeoDataFrame:
-        '''
+        """
         Given a geometry or bbox, return a geodataframe with 'county_name', 'state_name', 'geometry' (county geometry), sorted by 'COUNTYNS'
         County_name and state_name are the index
 
         input:
         geom - shapely.geometry or bbox
 
-        output: 
+        output:
         counties_df - geopandas.GeoDataFrame
-        '''
+        """
 
         if isinstance(geom, list) or isinstance(geom, tuple):
             if len(geom) != 4:
@@ -64,53 +65,52 @@ class APIWrapperRemoteProvider:
 
         elif not isinstance(geom, geometry.base.BaseGeometry):
             raise ValueError("geom must be a shapely geometry or a bbox")
-        
+
         # get the counties that intersect with the geometry
         counties_df = counties.intersects(geom)
         if len(counties_df) == 0:
             return gpd.GeoDataFrame(columns=["geometry", "id"])
-        
+
         # get the states that intersect with the geometry, and drop all except the statefp and name
         states_df = states.intersects(geom)
-        states_df = states_df[['STATEFP', 'NAME']]
+        states_df = states_df[["STATEFP", "NAME"]]
 
         # strip the whitespace from the statefp
-        counties_df['STATEFP'] = counties_df['STATEFP'].str.strip()
-        states_df['STATEFP'] = states_df['STATEFP'].str.strip()
+        counties_df["STATEFP"] = counties_df["STATEFP"].str.strip()
+        states_df["STATEFP"] = states_df["STATEFP"].str.strip()
 
         # join the counties and states on the statefp
-        counties_df.set_index('STATEFP', inplace=True)
-        states_df.set_index('STATEFP', inplace=True)
-        counties_and_states = counties_df.join(states_df, rsuffix='_state')
+        counties_df.set_index("STATEFP", inplace=True)
+        states_df.set_index("STATEFP", inplace=True)
+        counties_and_states = counties_df.join(states_df, rsuffix="_state")
 
-        counties_and_states.rename(columns={'NAME': 'county_name', 'NAME_state':'state_name'}, inplace=True)
-        counties_and_states = counties_and_states.sort_values(by=['COUNTYNS'])
+        counties_and_states.rename(columns={"NAME": "county_name", "NAME_state": "state_name"}, inplace=True)
+        counties_and_states = counties_and_states.sort_values(by=["COUNTYNS"])
 
-        counties_gdf = counties_and_states.set_index(['county_name', 'state_name'])
-        counties_gdf = counties_gdf[['geometry', 'COUNTYNS']]
+        counties_gdf = counties_and_states.set_index(["county_name", "state_name"])
+        counties_gdf = counties_gdf[["geometry", "COUNTYNS"]]
 
         return counties_gdf
-    
+
     def get_states_from_geometry(self, geom) -> gpd.GeoDataFrame:
-        '''
+        """
         do this later (for when we can only search by state)
-        '''
+        """
         pass
-    
 
     def create_query_list(
         self,
         bbox: List[float] = [],
         datetime: List[_datetime] = [],
         intersects: object = None,
-        #collections: List[str] = [],
-        #feature_ids: List[str] = [],
+        # collections: List[str] = [],
+        # feature_ids: List[str] = [],
         filter: Union[CQLFilter, dict] = None,
-        #fields: Union[List[str], dict] = None,
-        #sortby: dict = None,
+        # fields: Union[List[str], dict] = None,
+        # sortby: dict = None,
         method: str = "POST",
-        #page: int = None,
-        #page_size: int = None,
+        # page: int = None,
+        # page_size: int = None,
         **kwargs,
     ) -> List[dict]:
         """
@@ -140,9 +140,8 @@ class APIWrapperRemoteProvider:
             logger.info("No bbox or intersects provided. Using US as default.")
             geom = geometry.box(-179.9, 18.0, -66.9, 71.4)
 
-       counties_gdf = self.get_counties_from_geometry(geom) 
+        counties_gdf = self.get_counties_from_geometry(geom)
 
-        
         """
         DATETIME: Produce a list of years that intersect with the datetime range 
         """
@@ -154,55 +153,33 @@ class APIWrapperRemoteProvider:
 
             years_range = list(range(start_year, end_year + 1))
 
-        
         """
         FILTER:
         convert cql filter to query parameters and update
         """
         if filter:
             logger.info(f"Received CQL filter")
-            api_params.update(cql2_to_query_params(filter))
+            filter_params = cql2_to_query_params(filter)
 
-        """
-        FIELDS:  list of fields to include/exclude. Included fields should be prefixed by 
-        "+" and excluded fields by "-". Alernatively, a dict with a "include"/"exclude" lists 
-        may be provided
-        """
-        if fields:
-            logger.info(f"Received fields: {fields}")
-            if isinstance(fields, dict):
-                include = fields.get("include", [])
-                exclude = fields.get("exclude", [])
-            else:
-                include = [field for field in fields if field[0] == "+"]
-                exclude = [field for field in fields if field[0] == "-"]
-            # Example API has only exclude parameter TODO: Edit this to fit the API
-            api_params["exclude_columns"] = exclude
+        query_list = []
 
-        """
-        SORTBY: Handle sorting. Sortby is a dict containing “field” and “direction”. 
-        Direction may be one of “asc” or “desc”. Not supported by all datasets
-        """
-        if sortby:
-            logger.info(f"Received sortby: {sortby}")
-            api_params["sort"] = sortby.get("direction", "asc")
+        for row_index, row in counties_gdf.reset_index().iterrows():
+            query_params = {}
 
-        """
-        METHOD: Handle the method. This is the HTTP method to use for the request.
-        """
-        if "method" in self.queryables():
-            logger.info(f"Received method: {method}")
-            api_params["method"] = method
+            query_params["county_name"] = row["county_name"]
+            query_params["state_name"] = row["state_name"]
+            query_params["sector"] = "CROPS"
 
-        """
-        PAGINATION: Handle pagination (page and page_size)
-        """
-        if "page" in self.queryables():
-            api_params["page"] = page
-        if "page_size" in self.queryables():
-            api_params["page_size"] = page_size
+            if filter:
+                # FIXME: make sure this doesn't overwrite the other params, and that it consists only of valid params
+                query_params.update(filter_params)
 
-        return api_params
+            for year_index, year in enumerate(years_range):
+                query_params["year"] = year
+                query_params["query_index"] = row_index * len(years_range) + year_index
+                query_list.append(query_params)
+
+        return query_list
 
     def convert_results_to_gdf(self, response: Union[dict, List[dict]]) -> gpd.GeoDataFrame:
         """
