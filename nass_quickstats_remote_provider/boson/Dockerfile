@@ -18,5 +18,7 @@ COPY --from=builder /root/.local /root/.local
 
 WORKDIR /app
 COPY provider.py .
+COPY states.geoparquet .
+COPY counties.geoparquet .
 ENV PATH=/root/.local/bin:$PATH
 CMD /usr/local/bin/python3 -u -m uvicorn --host 0.0.0.0 --port ${PORT} --log-level trace provider:app
