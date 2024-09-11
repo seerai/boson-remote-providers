@@ -8,7 +8,10 @@ import json
 import geopandas as gpd
 from cachetools import TTLCache, cached
 from shapely import geometry
+import urllib.parse
 
+
+from boson import Pagination
 from boson.http import serve
 from boson.boson_core_pb2 import Property
 from boson.conversion import cql2_to_query_params
@@ -20,8 +23,8 @@ logger.addHandler(logging.StreamHandler())
 logger.setLevel(logging.INFO)
 
 
-STATE_PATH = "app/states.geoparquet"
-COUNTIES_PATH = "app/counties.geoparquet"
+STATE_PATH = "/app/states.geoparquet"
+COUNTIES_PATH = "/app/counties.geoparquet"
 
 
 class Boundaries:
@@ -37,7 +40,7 @@ counties = Boundaries(COUNTIES_PATH)
 states = Boundaries(STATE_PATH)
 
 
-class APIWrapperRemoteProvider:
+class NASSQuickStatsRemoteProvider:
     def __init__(self) -> None:
         self.api_url = "https://quickstats.nass.usda.gov/api/api_GET/"
         self.max_page_size = 50000
@@ -84,13 +87,22 @@ class APIWrapperRemoteProvider:
         states_df.set_index("STATEFP", inplace=True)
         counties_and_states = counties_df.join(states_df, rsuffix="_state")
 
-        counties_and_states.rename(columns={"NAME": "county_name", "NAME_state": "state_name"}, inplace=True)
+        counties_and_states.rename(
+            columns={"NAME": "county_name", "NAME_state": "state_name", "STUSPS": "state_alpha"}, inplace=True
+        )
         counties_and_states = counties_and_states.sort_values(by=["COUNTYNS"])
 
-        counties_gdf = counties_and_states.set_index(["county_name", "state_name"])
-        counties_gdf = counties_gdf[["geometry", "COUNTYNS"]]
+        # Make county_name and state_name uppercase, and set them as the index
+        counties_and_states["county_name"] = counties_and_states["county_name"].str.upper()
+        counties_and_states["state_name"] = counties_and_states["state_name"].str.upper()
+        counties_and_states["state_alpha"] = counties_and_states["state_aplha"].str.upper()
 
-        return counties_gdf
+        counties_gdf = counties_and_states.set_index(["county_name", "state_alpha"])
+        counties_gdf = counties_gdf[["geometry", "COUNTYNS", "state_name"]]
+
+        # Store the counties_gdf for later use
+        self.counties_gdf = counties_gdf
+        return
 
     def get_states_from_geometry(self, geom) -> gpd.GeoDataFrame:
         """
@@ -108,7 +120,7 @@ class APIWrapperRemoteProvider:
         filter: Union[CQLFilter, dict] = None,
         # fields: Union[List[str], dict] = None,
         # sortby: dict = None,
-        method: str = "POST",
+        # method: str = "POST",
         # page: int = None,
         # page_size: int = None,
         **kwargs,
@@ -140,7 +152,8 @@ class APIWrapperRemoteProvider:
             logger.info("No bbox or intersects provided. Using US as default.")
             geom = geometry.box(-179.9, 18.0, -66.9, 71.4)
 
-        counties_gdf = self.get_counties_from_geometry(geom)
+        self.get_counties_from_geometry(geom)
+        counties_gdf = self.counties_gdf
 
         """
         DATETIME: Produce a list of years that intersect with the datetime range 
@@ -152,6 +165,9 @@ class APIWrapperRemoteProvider:
             end_year = datetime[1].year
 
             years_range = list(range(start_year, end_year + 1))
+        else:
+            logger.info("No datetime provided. Using 2020-2024 as default.")
+            years_range = list(range(2020, 2025))
 
         """
         FILTER:
@@ -166,9 +182,10 @@ class APIWrapperRemoteProvider:
         for row_index, row in counties_gdf.reset_index().iterrows():
             query_params = {}
 
+            # FIXME: account for the possibility that there is no county (state only)
             query_params["county_name"] = row["county_name"]
-            query_params["state_name"] = row["state_name"]
-            query_params["sector"] = "CROPS"
+            query_params["state_alpha"] = row["state_alpha"]
+            query_params["sector_desc"] = "CROPS"
 
             if filter:
                 # FIXME: make sure this doesn't overwrite the other params, and that it consists only of valid params
@@ -181,59 +198,31 @@ class APIWrapperRemoteProvider:
 
         return query_list
 
-    def convert_results_to_gdf(self, response: Union[dict, List[dict]]) -> gpd.GeoDataFrame:
+    @cached(cache=TTLCache(maxsize=1024, ttl=3600 * 24))
+    def make_request(self, pagination={}, **kwargs) -> gpd.GeoDataFrame:
         """
-        Convert the response from the API to a GeoDataFrame. We are assuming the response is a list of json/dict.
-        You may need to get the "results" key from the response, depending on the API.
-
-        The template assumes point features and a single datetime, but this can be modified to handle other geometries
-        and multiple datetimes. The remaining outputs from the API response can be added to the properties dictionary.
+        Request data from the API and return a GeoDataFrame, and updated pagination object
         """
 
-        # This may need editing, depending on the API response
-        if isinstance(response, dict):
-            response = response.get("results", [])
+        # Get the current pagination
+        if not pagination:
+            pagination = Pagination({"token": "0-10-0"}, 10)
+            return gpd.GeoDataFrame(columns=["geometry", "id"]), pagination
 
-        logger.info("Converting API response to GeoDataFrame.")
-        logger.info(f"Received {len(response)} results. Converting to GeoDataFrame.")
-        if len(response) == 0:
-            return gpd.GeoDataFrame(columns=["geometry", "id"])
+        _, _, resource_index = pagination.get_current()
 
-        logger.info(f"First result: {response[0]}")
+        # Get the parameters for the current resource
+        if resource_index >= len(self.query_list):
+            logger.info("No more resources to query")
+            return gpd.GeoDataFrame(columns=["geometry", "id"]), pagination
+        else:
+            api_params = self.query_list[resource_index]
 
-        # TODO: Update the keys to match the API response
-        LATIDUDE_KEY = "Latitude"
-        LONGITUDE_KEY = "Longitude"
-        ID_KEY = "id"
-        DATETIME_KEY = "UTC"
-
-        gdf = gpd.GeoDataFrame(
-            response,
-            geometry=gpd.points_from_xy(
-                [obs.get(LONGITUDE_KEY) for obs in response],
-                [obs.get(LATIDUDE_KEY) for obs in response],
-            ),
-        )
-
-        gdf.set_index(ID_KEY, inplace=True)
-
-        # TODO: update datetime format
-        gdf["datetime"] = gdf[DATETIME_KEY].apply(lambda x: _datetime.strptime(x, format="%Y-%m-%dT%H:%M")).astype(str)
-
-        return gdf
-
-    def request_features(self, **kwargs) -> gpd.GeoDataFrame:
-        """
-        Request data from the API and return a GeoDataFrame. This function is unlikely to need
-        modification.
-        """
-        # Translate the input parameters to API parameters
-        logger.info(f"Parsing search input parameters: {kwargs}")
-        api_params = self.parse_input_params(**kwargs)
-
-        # Make a GET request to the API
         logger.info(f"Making request with params: {api_params}")
-        response = requests.get(self.api_url, api_params)
+
+        # Make the request
+        encoded_params = urllib.parse.urlencode(api_params)
+        response = requests.get(f"{self.api_url}?{encoded_params}")
 
         # Check if the request was successful (status code 200)
         if response.status_code == 200:
@@ -245,37 +234,27 @@ class APIWrapperRemoteProvider:
                 logger.info("No results returned from API")
                 gdf = gpd.GeoDataFrame(columns=["geometry", "id"])
 
-            gdf = self.convert_results_to_gdf(res)
-            logger.info(f"Received {len(gdf)} features")
+            # Get number of results and the geometry from counties_gdf
+            n_returned = len(res["data"])
+            state_alpha = api_params["state_alpha"]
+            county_name = api_params["county_name"]
+            area_geometry = self.counties_gdf.loc[(state_alpha, county_name), "geometry"]
+
+            gdf = gpd.GeoDataFrame(data=res["data"], geometry=[area_geometry] * n_returned)
+            logger.info(f"Received {n_returned} features")
         else:
             logging.error(f"Error: {response.status_code}")
             gdf = gpd.GeoDataFrame(columns=["geometry", "id"])
 
-        return gdf
+        # Update the pagination
+        next_pagination = pagination.get_next_token(offset=0, resource_index=resource_index + 1)
+
+        return gdf, next_pagination
 
     def search(self, pagination={}, provider_properties={}, **kwargs) -> gpd.GeoDataFrame:
         """Implements the Boson Search endpoint."""
         logger.info("Making request to API.")
         logger.info(f"Search received kwargs: {kwargs}")
-
-        """
-        PAGINATION and LIMIT: if limit is None, Boson will page through all results. Set a max
-        page size in the __init__ to control the size of each page. If limit is set, the search function
-        will return that number of results. Pagination is a dictionary with the keys "page" and "page_size".
-        We will pass "page" and "page_size" to the request_features function.
-        """
-        page = 1
-        page_size = self.max_page_size
-        limit = kwargs.get("limit", None)
-        if limit == 0:
-            limit = None
-        if limit is not None:
-            page_size = limit if limit <= self.max_page_size else self.max_page_size
-
-        if pagination:
-            logger.info(f"Received pagination: {pagination}")
-            page = pagination.get("page", None)
-            page_size = pagination.get("page_size", self.max_page_size)
 
         """
         PROVIDER_PROPERTIES: 
@@ -291,78 +270,60 @@ class APIWrapperRemoteProvider:
             if statisticcat_desc:
                 kwargs["statisticcat_desc"] = statisticcat_desc
 
-        gdf = self.request_features(page=page, page_size=page_size, **kwargs)
+        self.query_list = self.create_query_list(**kwargs)
 
-        return gdf, {
-            "page": page + 1,
-            "page_size": page_size,
-        }
-
-    def get_queryables_from_openapi(self, openapi_path: str) -> dict:
         """
-        This method is used to automatically generate the queryables from an openapi file. Manually entering the
-        queryyables is laborious. If the external API provides and OpenAPI spec, this method will read it from
-        a json file and return the queryables automatically. (credit: Mark Schulist)
+        PAGINATION and LIMIT
         """
-        with open(openapi_path, "r") as f:  # loading locally because more speedy
-            response = json.load(f)
-        queryables = {}
+        limit = kwargs.pop("limit", 10)
 
-        path = "/occurrence/search"  # TODO: Update with path for your API
+        if pagination:
+            logger.info(f"Received pagination: {pagination}")
+        else:
+            pagination = Pagination({"token": f"0-{limit}-0"}, limit)
 
-        params = response["paths"][path]["get"]["parameters"]
+        """
+        Make the requests
+        """
+        gdf, next_pagination = self.make_request(pagination=pagination, **kwargs)
 
-        for param in params:
-            title = param.get("name")
-            type = param.get("type")
-            enum = None
-            if param.get("schema") is not None:
-                schema = param.get("schema")
-                if schema.get("items") is not None:
-                    items = schema.get("items")
-                    enum = items.get("enum")
-            if enum is not None:
-                queryables[title] = Property(title=title, type=type, enum=enum)
-            else:
-                queryables[title] = Property(title=title, type=type)
-
-        return queryables
+        return gdf, next_pagination
 
     def queryables(self, **kwargs) -> dict:
-        """
-        Update this method to return a dictionary of queryable parameters that the API accepts.
-        The keys should be the parameter names. The values should be a Property object that follows
-        the conventions of JSON Schema.
-        """
         # if you have an openapi file, you can use the get_queryables_from_openapi method
         # to automatically generate the queryables
         if os.path.isfile("path_to_openapi_file"):
             return self.get_queryables_from_openapi(openapi_path="path_to_openapi_file")
         else:
             return {
-                "example_parameter": Property(
-                    title="parameter_title",
+                "state_alpha": Property(
+                    title="state_alpha",
                     type="string",
-                    enum=[
-                        "option1",
-                        "option2",
-                        "option3",
-                    ],
                 ),
-                "example_parameter2": Property(
-                    title="parameter_title2",
-                    type="integer",
+                "county_name": Property(
+                    title="county_name",
+                    type="string",
                 ),
-                "example_parameter3": Property(
-                    title="parameter_title3",
-                    type="integer",
+                "agg_level_desc": Property(
+                    title="aggregation_level",
+                    type="string",
+                    # enum=["COUNTY", "STATE"],
                 ),
-                "example_parameter4": Property(
-                    title="parameter_title4",
-                    type="boolean",
+                "source_desc": Property(
+                    title="source_description",
+                    type="string",
+                    # enum=["SURVEY", "CENSUS"],
+                ),
+                "statisticcat_desc": Property(
+                    title="statistic_category_description",
+                    type="string",
+                ),
+                "commodity_desc": Property(
+                    title="commodity_description",
+                    type="string",
                 ),
             }
 
 
-api_wrapper = APIWrapperRemoteProvider()
+api_wrapper = NASSQuickStatsRemoteProvider()
 app = serve(search_func=api_wrapper.search, queryables_func=api_wrapper.queryables)
