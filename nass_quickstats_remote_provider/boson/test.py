@@ -1,4 +1,8 @@
 import requests as r
 
 res = r.post("http://localhost:8000/search")
-print(res.content)
+js = res.json()
+if "detail" in js:
+    print(js["detail"])
+else:
+    print(js)

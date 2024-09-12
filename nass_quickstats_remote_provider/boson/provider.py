@@ -9,7 +9,7 @@ import geopandas as gpd
 from cachetools import TTLCache, cached
 from shapely import geometry
 import urllib.parse
-
+import pandas as pd
 
 from boson import Pagination
 from boson.http import serve
@@ -70,45 +70,27 @@ class NASSQuickStatsRemoteProvider:
             raise ValueError("geom must be a shapely geometry or a bbox")
 
         # get the counties that intersect with the geometry
-        counties_df = counties.intersects(geom)
-        if len(counties_df) == 0:
+        counties_gdf = counties.intersects(geom)
+        if len(counties_gdf) == 0:
             return gpd.GeoDataFrame(columns=["geometry", "id"])
 
-        # get the states that intersect with the geometry, and drop all except the statefp and name
-        states_df = states.intersects(geom)
-        states_df = states_df[["STATEFP", "NAME"]]
-
-        # strip the whitespace from the statefp
-        counties_df["STATEFP"] = counties_df["STATEFP"].str.strip()
-        states_df["STATEFP"] = states_df["STATEFP"].str.strip()
-
-        # join the counties and states on the statefp
-        counties_df.set_index("STATEFP", inplace=True)
-        states_df.set_index("STATEFP", inplace=True)
-        counties_and_states = counties_df.join(states_df, rsuffix="_state")
-
-        counties_and_states.rename(
-            columns={"NAME": "county_name", "NAME_state": "state_name", "STUSPS": "state_alpha"}, inplace=True
-        )
-        counties_and_states = counties_and_states.sort_values(by=["COUNTYNS"])
-
-        # Make county_name and state_name uppercase, and set them as the index
-        counties_and_states["county_name"] = counties_and_states["county_name"].str.upper()
-        counties_and_states["state_name"] = counties_and_states["state_name"].str.upper()
-        counties_and_states["state_alpha"] = counties_and_states["state_aplha"].str.upper()
-
-        counties_gdf = counties_and_states.set_index(["county_name", "state_alpha"])
-        counties_gdf = counties_gdf[["geometry", "COUNTYNS", "state_name"]]
-
-        # Store the counties_gdf for later use
-        self.counties_gdf = counties_gdf
-        return
+        return counties_gdf
 
     def get_states_from_geometry(self, geom) -> gpd.GeoDataFrame:
         """
         do this later (for when we can only search by state)
         """
-        pass
+        if isinstance(geom, list) or isinstance(geom, tuple):
+            if len(geom) != 4:
+                raise ValueError("bbox must be a bounding box with 4 coordinates")
+            geom = geometry.box(*geom)
+
+        elif not isinstance(geom, geometry.base.BaseGeometry):
+            raise ValueError("geom must be a shapely geometry or a bbox")
+
+        # get the states that intersect with the geometry, and drop all except the statefp and name
+        states_df = states.intersects(geom)
+        return states_df
 
     def create_query_list(
         self,
@@ -123,18 +105,12 @@ class NASSQuickStatsRemoteProvider:
         # method: str = "POST",
         # page: int = None,
         # page_size: int = None,
+        extra_params: dict = {},
         **kwargs,
     ) -> List[dict]:
         """
         This parses the geodesic search parameters and outputs a list of parameter dicts, one for each state or county and year
         """
-        api_params = {}
-
-        """
-        DEFAULTS
-        """
-        if self.api_default_params:
-            api_params.update(self.api_default_params)
 
         """
         BBOX/INTERSECTS::
@@ -152,8 +128,8 @@ class NASSQuickStatsRemoteProvider:
             logger.info("No bbox or intersects provided. Using US as default.")
             geom = geometry.box(-179.9, 18.0, -66.9, 71.4)
 
-        self.get_counties_from_geometry(geom)
-        counties_gdf = self.counties_gdf
+        counties_gdf = self.get_counties_from_geometry(geom)
+        states_gdf = self.get_states_from_geometry(geom)
 
         """
         DATETIME: Produce a list of years that intersect with the datetime range 
@@ -166,8 +142,8 @@ class NASSQuickStatsRemoteProvider:
 
             years_range = list(range(start_year, end_year + 1))
         else:
-            logger.info("No datetime provided. Using 2020-2024 as default.")
-            years_range = list(range(2020, 2025))
+            logger.info("No datetime provided. Using 2023 as default.")
+            years_range = [2023]
 
         """
         FILTER:
@@ -179,13 +155,18 @@ class NASSQuickStatsRemoteProvider:
 
         query_list = []
 
-        for row_index, row in counties_gdf.reset_index().iterrows():
+        for row_index, row in states_gdf.reset_index().iterrows():
             query_params = {}
 
+            query_params.update(extra_params)
+
+            if self.api_default_params:
+                query_params.update(self.api_default_params)
+
             # FIXME: account for the possibility that there is no county (state only)
-            query_params["county_name"] = row["county_name"]
-            query_params["state_alpha"] = row["state_alpha"]
+            query_params["state_fips_code"] = row["STATEFP"]
             query_params["sector_desc"] = "CROPS"
+            query_params["agg_level_desc"] = "COUNTY"
 
             if filter:
                 # FIXME: make sure this doesn't overwrite the other params, and that it consists only of valid params
@@ -193,35 +174,13 @@ class NASSQuickStatsRemoteProvider:
 
             for year_index, year in enumerate(years_range):
                 query_params["year"] = year
-                query_params["query_index"] = row_index * len(years_range) + year_index
+                # query_params["query_index"] = row_index * len(years_range) + year_index
                 query_list.append(query_params)
 
-        return query_list
+        return query_list, counties_gdf
 
     @cached(cache=TTLCache(maxsize=1024, ttl=3600 * 24))
-    def make_request(self, pagination={}, **kwargs) -> gpd.GeoDataFrame:
-        """
-        Request data from the API and return a GeoDataFrame, and updated pagination object
-        """
-
-        # Get the current pagination
-        if not pagination:
-            pagination = Pagination({"token": "0-10-0"}, 10)
-            return gpd.GeoDataFrame(columns=["geometry", "id"]), pagination
-
-        _, _, resource_index = pagination.get_current()
-
-        # Get the parameters for the current resource
-        if resource_index >= len(self.query_list):
-            logger.info("No more resources to query")
-            return gpd.GeoDataFrame(columns=["geometry", "id"]), pagination
-        else:
-            api_params = self.query_list[resource_index]
-
-        logger.info(f"Making request with params: {api_params}")
-
-        # Make the request
-        encoded_params = urllib.parse.urlencode(api_params)
+    def _make_request(self, encoded_params: str) -> pd.DataFrame:
         response = requests.get(f"{self.api_url}?{encoded_params}")
 
         # Check if the request was successful (status code 200)
@@ -232,24 +191,78 @@ class NASSQuickStatsRemoteProvider:
             # Check if the response is empty
             if not res:
                 logger.info("No results returned from API")
-                gdf = gpd.GeoDataFrame(columns=["geometry", "id"])
+                df = pd.DataFrame()
 
             # Get number of results and the geometry from counties_gdf
             n_returned = len(res["data"])
-            state_alpha = api_params["state_alpha"]
-            county_name = api_params["county_name"]
-            area_geometry = self.counties_gdf.loc[(state_alpha, county_name), "geometry"]
-
-            gdf = gpd.GeoDataFrame(data=res["data"], geometry=[area_geometry] * n_returned)
             logger.info(f"Received {n_returned} features")
+            df = pd.DataFrame(res["data"])
         else:
             logging.error(f"Error: {response.status_code}")
-            gdf = gpd.GeoDataFrame(columns=["geometry", "id"])
+            df = pd.DataFrame()
+
+        return df
+
+    def make_request(self, pagination={}, query_list=[], counties_gdf=None, **kwargs) -> gpd.GeoDataFrame:
+        """
+        Request data from the API and return a GeoDataFrame, and updated pagination object
+        """
+
+        # Get the current pagination
+        # if not pagination:
+        #     pagination = Pagination({"token": "0-10-0"}, 10)
+        #     return gpd.GeoDataFrame(columns=["geometry", "id"]), pagination
+
+        offset, page_size, resource_index = pagination.get_current()
+
+        logger.info(f"Current pagination: offset={offset}, page_size={page_size}, resource_index={resource_index}")
+        logger.info(f"Current query_list len: {len(query_list)}")
+        # Get the parameters for the current resource
+        if resource_index >= len(query_list):
+            logger.info("No more resources to query")
+            return gpd.GeoDataFrame(columns=["geometry", "id"]), {}
+
+        results_gdf = gpd.GeoDataFrame(columns=["geometry", "id"])
+
+        for resource_index in range(resource_index, len(query_list)):
+
+            api_params = query_list[resource_index]
+            logger.info(f"Making request with params: {api_params}")
+
+            # Make the request
+            encoded_params = urllib.parse.urlencode(api_params)
+            df = self._make_request(encoded_params)
+            logger.info(f"len(df) from _make_request: {len(df)}")
+
+            joined_df = pd.merge(
+                df,
+                counties_gdf,
+                left_on=["state_fips_code", "county_code"],
+                right_on=["STATEFP", "COUNTYFP"],
+                how="inner",
+            )
+            gdf = gpd.GeoDataFrame(joined_df, geometry=joined_df.geometry)
+
+            # Append the results to the results_gdf
+            end_index = offset + min(len(gdf), page_size - len(results_gdf))
+            logger.info(f"end_index: {end_index}")
+            gdf = gdf[offset:end_index]
+
+            logger.info(f"Appending {len(gdf)} results to the results_gdf")
+            logger.info(f"offset: {offset}, page_size: {page_size}, len(results_gdf): {len(results_gdf)}")
+            offset = end_index
+
+            temp = pd.concat([results_gdf, gdf], ignore_index=True)
+            results_gdf = gpd.GeoDataFrame(temp, geometry=temp.geometry)
+
+            if len(results_gdf) >= page_size:
+                results_gdf = results_gdf[:page_size]
+                break
 
         # Update the pagination
-        next_pagination = pagination.get_next_token(offset=0, resource_index=resource_index + 1)
+        next_pagination = pagination.get_next_token(offset=offset, resource_index=resource_index)
 
-        return gdf, next_pagination
+        return results_gdf, next_pagination
 
     def search(self, pagination={}, provider_properties={}, **kwargs) -> gpd.GeoDataFrame:
         """Implements the Boson Search endpoint."""
@@ -259,43 +272,50 @@ class NASSQuickStatsRemoteProvider:
         """
         PROVIDER_PROPERTIES: 
         """
-        if provider_properties:
-            logger.info(f"Received provider_properties from boson_config.properties: {provider_properties}")
-            # Check for source_desc (Program)
-            source_desc = provider_properties.get("source_desc", "SURVEY")
-            kwargs["source_desc"] = source_desc
+        extra_params = {}
 
-            # Check for statisticcat_desc (Statistic Category)
-            statisticcat_desc = provider_properties.get("statisticcat_desc", None)
-            if statisticcat_desc:
-                kwargs["statisticcat_desc"] = statisticcat_desc
+        logger.info(f"Received provider_properties from boson_config.properties: {provider_properties}")
 
-        self.query_list = self.create_query_list(**kwargs)
+        # Check for source_desc (Program)
+        source_desc = provider_properties.get("source_desc", "SURVEY")
+        extra_params["source_desc"] = source_desc
+
+        # Check for statisticcat_desc (Statistic Category)
+        statisticcat_desc = provider_properties.get("statisticcat_desc", None)
+        if statisticcat_desc:
+            extra_params["statisticcat_desc"] = statisticcat_desc
+
+        # Check for commodity_desc (Commodity)
+        commodity_desc = provider_properties.get("commodity_desc", "CORN")
+        if commodity_desc:
+            extra_params["commodity_desc"] = commodity_desc
+
+        query_list, counties_gdf = self.create_query_list(extra_params=extra_params, **kwargs)
 
         """
         PAGINATION and LIMIT
         """
         limit = kwargs.pop("limit", 10)
+        if limit == 0:
+            limit = 10
 
-        if pagination:
-            logger.info(f"Received pagination: {pagination}")
-        else:
-            pagination = Pagination({"token": f"0-{limit}-0"}, limit)
+        pagination = Pagination(pagination, limit)
+        logger.info(f"limit: {limit}, pagination page_size: {pagination.page_size}")
 
         """
         Make the requests
         """
-        gdf, next_pagination = self.make_request(pagination=pagination, **kwargs)
+        gdf, next_pagination = self.make_request(
+            pagination=pagination, query_list=query_list, counties_gdf=counties_gdf, **kwargs
+        )
 
         return gdf, next_pagination
 
     def queryables(self, **kwargs) -> dict:
         # if you have an openapi file, you can use the get_queryables_from_openapi method
         # to automatically generate the queryables
-        if os.path.isfile("path_to_openapi_file"):
-            return self.get_queryables_from_openapi(openapi_path="path_to_openapi_file")
-        else:
-            return {
+        return {
+            "commodities": {
                 "state_alpha": Property(
                     title="state_alpha",
                     type="string",
@@ -305,24 +325,25 @@ class NASSQuickStatsRemoteProvider:
                     type="string",
                 ),
                 "agg_level_desc": Property(
-                    title="aggregation_level",
+                    title="agg_level_desc",
                     type="string",
                     # enum=["COUNTY", "STATE"],
                 ),
                 "source_desc": Property(
-                    title="source_description",
+                    title="source_desc",
                     type="string",
                     # enum=["SURVEY", "CENSUS"],
                 ),
                 "statisticcat_desc": Property(
-                    title="statistic_category_description",
+                    title="statisticcat_desc",
                     type="string",
                 ),
                 "commodity_desc": Property(
-                    title="commodity_description",
+                    title="commodity_desc",
                     type="string",
                 ),
             }
+        }
 
 
 api_wrapper = NASSQuickStatsRemoteProvider()
