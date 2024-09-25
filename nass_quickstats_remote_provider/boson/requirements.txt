@@ -1,5 +1,0 @@
-geodesic-api
-boson-sdk[all]
-geopandas
-pyarrow
-cachetools
