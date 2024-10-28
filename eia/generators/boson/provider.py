@@ -175,6 +175,10 @@ class EIAGenerators:
         else:
             return gpd.GeoDataFrame(), {}
 
+        # Convert all numeric cols to numeric
+        for col in gdf.columns:
+            gdf[col] = pd.to_numeric(gdf[col], errors="ignore")
+
         return gdf, {"token": pagination.get_next_token(offset + len(gdf))}
 
     def update_facets(self, x_params: dict, filter: dict):
