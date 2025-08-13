@@ -1,0 +1,60 @@
+{
+    "quality_grade": "needs_id",
+    "time_observed_at": "2024-06-15T16:11:00-05:00",
+    "uuid": "698902d2-d484-4621-aa82-d2259c49b3c6",
+    "id": 223335626,
+    "species_guess": "Dacnis hartlaubi",
+    "positional_accuracy": null,
+    "license_code": "cc-by-nc",
+    "public_positional_accuracy": 31394,
+    "created_at": "2024-06-17T09:01:58-05:00",
+    "observed_on": "2024-06-15",
+    "updated_at": "2024-06-17T09:01:58-05:00",
+    "captive": false,
+    "taxon": {
+        "endemic": true,
+        "iconic_taxon_id": 3,
+        "min_species_taxon_id": 72792,
+        "threatened": true,
+        "introduced": false,
+        "native": true,
+        "parent_id": 10505,
+        "name": "Dacnis hartlaubi",
+        "rank": "species",
+        "extinct": false,
+        "id": 72792,
+        "default_photo": {
+            "license_code": "cc-by-nc",
+            "attribution": "(c) Sebas Arango, some rights reserved (CC BY-NC), uploaded by Sebas Arango",
+            "url": "https://inaturalist-open-data.s3.amazonaws.com/photos/34258201/square.jpg",
+            "square_url": "https://inaturalist-open-data.s3.amazonaws.com/photos/34258201/square.jpg",
+            "medium_url": "https://inaturalist-open-data.s3.amazonaws.com/photos/34258201/medium.jpg"
+        },
+        "observations_count": 131,
+        "wikipedia_url": "http://en.wikipedia.org/wiki/Turquoise_dacnis",
+        "complete_rank": "subspecies",
+        "iconic_taxon_name": "Aves",
+        "preferred_common_name": "Turquoise Dacnis",
+        "conservation_status": {
+            "status_name": "vulnerable",
+        }
+    },
+    "uri": "https://www.inaturalist.org/observations/223335626",
+    "geojson": {
+        "type": "Point",
+        "coordinates": [
+            -74.5706907268,
+            4.9251877733
+        ]
+    },
+    "geoprivacy": null,
+    "location": "4.9251877733,-74.5706907268",
+    "observation_photos": [
+        {
+            "photo": {
+                "url": "https://inaturalist-open-data.s3.amazonaws.com/photos/395707882/square.jpeg",
+                "attribution": "(c) hugo efraín garzón castrillón, some rights reserved (cc by-nc)",
+            }
+        }
+    ],
+}
