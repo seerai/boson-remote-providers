@@ -1,11 +1,9 @@
-FROM python:3.8-slim-buster as builder
+FROM python:3.8-slim-bullseye AS builder
 
 # Update base container install
 RUN apt-get update \
-    && apt-get install -y python3-pip\
-    && apt-get install -y git \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+    && apt-get install -y python3-pip git\
+    && rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m pip install pip --upgrade
 
@@ -13,7 +11,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --user -r requirements.txt
 
-FROM python:3.8-slim-buster as runner
+FROM python:3.8-slim-bullseye AS runner
 COPY --from=builder /root/.local /root/.local
 
 WORKDIR /app
