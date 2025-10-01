@@ -167,9 +167,8 @@ class iNaturalistRemoteProvider:
         """
         features = []
         for observation in response["results"]:
-            # Extract the coordinates from the observation
+            # Extract the coordinates and datetime from the observation
             logger.debug(f"Observation: {observation}")
-            id = str(observation.pop("id", None))
             geometry = observation.get("geojson", None)
             obs_datetime = observation.get("time_observed_at", None)
 
@@ -184,9 +183,9 @@ class iNaturalistRemoteProvider:
             if geometry is None:
                 geometry = {"type": "Point", "coordinates": [0, 0]}
 
-            feature_properties = {"id": id, "geometry": geometry, "properties": {}, "datetime": obs_datetime}
+            feature = {"geometry": geometry, "properties": {}, "datetime": obs_datetime}
 
-            # Flatten certain properties for easier access
+            # Flatten certain properties for easier access, and add to the observation dict
             _, wiki = flatten_property(observation, ["taxon", "wikipedia_url"])
 
             _, default_photo_url = flatten_property(observation, ["taxon", "default_photo", "medium_url"])
@@ -206,72 +205,97 @@ class iNaturalistRemoteProvider:
             observation["iconic_taxon_name"] = taxon_name
             observation["preferred_common_name"] = preferred_name
 
-            # Create a geodesic.Feature from the observation
-            feature = geodesic.Feature(
-                **feature_properties,
-            )
-
             # Add the observation data to the feature's properties
-            feature.properties.update(observation)
+            feature['properties'].update(observation)
 
-            # Add the feature to the list
             features.append(feature)
+        
+        fc = {"type": "FeatureCollection", "features": features}
 
-        logger.info(f"Number of features: {len(features)}")
-        logger.info(f"type of features: {type(features)}")
+        logger.debug(f"Number of features: {len(features)}")
+        logger.debug(f"type of features: {type(features)}")
+        logger.debug(f"features[0]: {features[0] if features else 'No features'}")
 
-        features_gdf = geodesic.FeatureCollection(features=features).gdf
-        feature_ids = [f.id for f in features]
-        features_gdf["id"] = feature_ids
-
-        # Logging
-        if "id" in features_gdf.columns:
-            logger.info(f"features_gdf has id column - number of unique ids: {len(features_gdf['id'].unique())}")
-            logger.info(f"head features['id']: {features_gdf['id'].head()}")
-        else:
-            logger.info(f"features_gdf does not have id column")
+        features_gdf = gpd.GeoDataFrame.from_features(fc)
 
         logger.info(f"shape of features_gdf: {features_gdf.shape}")
-        # logger.info(f"features_gdf columns: {features_gdf.columns}")
-        logger.info(f"features_gdf index: {features_gdf.index}")
-        logger.info(f"features_gdf head: {features_gdf.head()}")
+        logger.debug(f"features_gdf columns: {features_gdf.columns}")
+        logger.debug(f"features_gdf head: {features_gdf.head()}")
         logger.debug(f"Converted features to type: {type(features_gdf)} and shape: {features_gdf.shape}")
 
-        # Deal with fields - start with default fields
-        columns_to_return = self._default_fields_to_return
+        # Deal with fields
+        columns_to_return = list(set(self._default_fields_to_return + self._required_fields))
+        logger.debug(f"Columns to return before fields parsing: {columns_to_return}")
 
         if fields:
+            logger.info(f"Received fields: {fields}")
             # add columns_to_return from fields['include'], or include all if 'include' is 'all'
+            # but first, check if fields is a list or dict. If list, convert to dict with 'include' key
+            if isinstance(fields, list):
+                fields_dict = {}
+                for field in fields:
+                    if field.startswith('+'):
+                        if 'include' in fields_dict:
+                            fields_dict['include'].append(field[1:])
+                        else:
+                            fields_dict['include'] = [field[1:]]
+                    elif field.startswith('-'):
+                        if 'exclude' in fields_dict:
+                            fields_dict['exclude'].append(field[1:])
+                        else:
+                            fields_dict['exclude'] = [field[1:]]
+                    else:
+                        raise ValueError(
+                            f"Invalid field format: {field}. Fields should start with '+' or '-'."
+                        )
+                fields = fields_dict
+            
+            # The columns logic is based on the dict form of fields. We converted the list forms, so
+            # at this point, fields is either a dict or invalid. We check if fields is a dict, and
+            # then proceed parsing which columns to include
+            if not isinstance(fields, dict):
+                raise TypeError(
+                    f"""Fields should be a dict with 'include' and/or 'exclude' keys, or 
+                    a list of strings each prefixes with '+' or '-'. Received: {type(fields)}"""
+                )
+            
             if "include" in fields:
-                if fields["include"] == ["all"]:
+                if any(field in ["all", "all_fields", "*"] for field in fields["include"]):
                     columns_to_return = features_gdf.columns
-                else:
+                elif fields["include"]:  # Check if the list is not empty
                     columns_to_return.extend(
-                        fld
-                        for fld in fields["include"]
-                        if (fld not in columns_to_return and fld in features_gdf.columns)
+                        field
+                        for field in fields["include"]
+                        if (field not in columns_to_return and field in features_gdf.columns)
                     )
 
             # remove columns_to_return from fields['exclude']
             if "exclude" in fields:
-                columns_to_return = [
-                    fld
-                    for fld in columns_to_return
-                    if (fld not in fields["exclude"] and fld not in self._required_fields)
-                ]
+                if fields["exclude"]:
+                    columns_to_return = [
+                        field
+                        for field in columns_to_return
+                        if not (field in fields["exclude"] and field not in self._required_fields)
+                    ]
 
         # Filter the columns to return, keeping in mind that not all columns may be present in the data
         columns_to_return = [col for col in columns_to_return if col in features_gdf.columns]
+        logger.debug(f"Columns to return after parsing: {columns_to_return}")
 
         # Filter the columns to return
         features_gdf = features_gdf[columns_to_return]
 
-        # Make sure the id column exists
-        if "id" not in features_gdf.columns or "geometry" not in features_gdf.columns:
-            features_gdf = gpd.GeoDataFrame(columns=["geometry", "id"])
+        # Make sure the geometry column exists
+        if "geometry" not in features_gdf.columns:
+            features_gdf["geometry"] = None
 
-        features_gdf = features_gdf.set_index("id")
-        logger.info(
+        # make sure 'id' is non-null and set as index
+        if "id" in features_gdf.columns and features_gdf["id"].notna().all():
+            features_gdf = features_gdf.set_index("id")
+        else:
+            raise ValueError("The 'id' column is missing or contains invalid values.")
+        
+        logger.debug(
             f"features_gdf has set index to 'id'. features_gdf shape: {features_gdf.shape} vs. number of unique ids {len(features_gdf.index.unique())}"
         )
         logger.debug(f"Filtered fields. Returning gdf ({type(features_gdf)}) with shape: {features_gdf.shape}")
@@ -295,10 +319,10 @@ class iNaturalistRemoteProvider:
             # Parse and use the response data (JSON in this case)
             res = response.json()
 
-            features_gdf = self.convert_results_to_features(res)
+            features_gdf = self.convert_results_to_features(res, fields=kwargs.get("fields", {}))
 
             numberMatched = res["total_results"]
-            logger.info(f"Total results: {numberMatched}")
+            logger.info(f"Total results (not necessarily returned): {numberMatched}")
 
             logger.info(f"Received {len(features_gdf)} features")
         else:
@@ -306,7 +330,6 @@ class iNaturalistRemoteProvider:
             numberMatched = 0
             features_gdf = gpd.GeoDataFrame(columns=["geometry", "id"])
 
-            logger.debug(f"request_features is returning type {type(features_gdf)} and shape {features_gdf.shape}")
         return features_gdf, numberMatched
 
     def search(self, pagination={}, provider_properties={}, **kwargs) -> geodesic.FeatureCollection:
