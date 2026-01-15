@@ -167,10 +167,13 @@ class EIAGenerators:
 
         # Create the dataframe from the results
         data = response.get("data", [])
-        gdf = gpd.GeoDataFrame(data)
-        gdf.loc[:, "period"] = pd.to_datetime(gdf.period, utc=True)
-        geometry_column = gpd.points_from_xy(gdf.longitude, gdf.latitude)
-        gdf = gpd.GeoDataFrame(gdf, geometry=geometry_column)
+        if data:
+            gdf = gpd.GeoDataFrame(data)
+            gdf.loc[:, "period"] = pd.to_datetime(gdf.period, utc=True)
+            geometry_column = gpd.points_from_xy(gdf.longitude, gdf.latitude)
+            gdf = gpd.GeoDataFrame(gdf, geometry=geometry_column)
+        else:
+            return gpd.GeoDataFrame(), {}
 
         return gdf, {"token": pagination.get_next_token(offset + len(gdf))}
 
