@@ -131,8 +131,15 @@ class EIAElectricity:
 
         # Create the dataframe from the results
         data = response.get("data", [])
-        gdf = gpd.GeoDataFrame(data)
-        gdf.loc[:, "period"] = pd.to_datetime(gdf.period, utc=True)
+        if data:
+            gdf = gpd.GeoDataFrame(data)
+            gdf.loc[:, "period"] = pd.to_datetime(gdf.period, utc=True)
+        else:
+            return gpd.GeoDataFrame(), {}
+
+        # Convert all numeric cols to numeric
+        for col in gdf.columns:
+            gdf[col] = pd.to_numeric(gdf[col], errors="ignore")
 
         return gdf, {"token": pagination.get_next_token(offset + len(gdf))}
 
